@@ -3,12 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
 
 	"github.com/dedis/protobuf"
 )
+
+//Global variables
+var rumorID uint32 = 1
 
 //Gossiper contains all relevant inputs to the gossiper program.
 type Gossiper struct {
@@ -40,9 +44,16 @@ type PeerStatus struct {
 	NextID     uint32
 }
 
+//StatusPacket is the status.
+type StatusPacket struct {
+	Want []PeerStatus
+}
+
 //GossipPacket To provide compatibility with future versions
 type GossipPacket struct {
 	Simple *SimpleMessage
+	Rumor  *RumorMessage
+	Status *StatusPacket
 }
 
 //listenClient listens to the client in an infinite loop.
@@ -65,16 +76,42 @@ func (g *Gossiper) listenClient() {
 
 	for {
 		buffer := make([]byte, 1024)
-		conn.Read(buffer)
-		fmt.Println("CLIENT MESSAGE " + string(buffer))
-		fmt.Println("PEERS " + g.peers)
-		var simplemessage SimpleMessage = SimpleMessage{
-			OriginalName:  g.name,
-			RelayPeerAddr: g.gossipAddr,
-			Contents:      string(buffer),
+		n, err := conn.Read(buffer)
+		fmt.Println(conn.LocalAddr())
+		if err != nil {
+			fmt.Println("ERROR WHILE READING BUFFER:", err)
+			return
 		}
-		var gp = GossipPacket{Simple: &simplemessage}
-		g.sendGossip(gp, g.gossipAddr)
+		buffer = buffer[0:n]
+		var messageType byte = buffer[len(buffer)-1]
+		switch messageType {
+		case 48: //48 corresponds to 0
+			fmt.Println("CLIENT MESSAGE " + string(buffer[0:len(buffer)-1]))
+			fmt.Println("PEERS " + g.peers)
+			var simplemessage SimpleMessage = SimpleMessage{
+				OriginalName:  g.name,
+				RelayPeerAddr: g.gossipAddr,
+				Contents:      string(buffer[0 : len(buffer)-1]),
+			}
+			var gp = GossipPacket{Simple: &simplemessage}
+			g.sendGossip(gp, g.gossipAddr)
+
+		case 49: //49 corresponds to 1
+			fmt.Println("CLIENT MESSAGE " + string(buffer[0:len(buffer)-1]))
+			fmt.Println("PEERS " + g.peers)
+			var rumormessage RumorMessage = RumorMessage{
+				Origin: g.name,
+				ID:     rumorID,
+				Text:   string(buffer[0 : len(buffer)-1]),
+			}
+			rumorID++
+			var gp = GossipPacket{Rumor: &rumormessage}
+			g.sendGossip(gp, g.gossipAddr)
+
+		default: //Some extra logic here if necessary
+			println("Sorry, no known meaning of that last character!")
+			return
+		}
 
 	}
 }
@@ -98,7 +135,7 @@ func (g *Gossiper) listenPeers() {
 	}
 	defer conn.Close()
 
-	for {
+	for { //TODO: ListenPeers modification for Rumor mongering
 		buffer := make([]byte, 4096)
 		n, err := conn.Read(buffer)
 		if err != nil {
@@ -142,32 +179,98 @@ func (g *Gossiper) listenPeers() {
 //sendGossip spreads the message to the neighbor peers.
 func (g *Gossiper) sendGossip(gp GossipPacket, spreader string) {
 	//fmt.Println(g.knownAddresses, spreader)
-	for _, addr := range g.knownAddresses {
-		if addr == "" {
+	if gp.Simple != nil {
+		if len(g.knownAddresses) == 0 {
 			return
 		}
-		if addr == spreader {
-			continue
-		}
-		conn, err := net.Dial("udp", addr)
-		if err != nil {
-			fmt.Println("ERROR:", err)
-			return
-		}
-		defer conn.Close()
+		for _, addr := range g.knownAddresses {
+			if addr == spreader {
+				continue
+			}
+			conn, err := net.Dial("udp", addr)
+			if err != nil {
+				fmt.Println("ERROR:", err)
+				return
+			}
+			defer conn.Close()
 
-		packetBytes, err := protobuf.Encode(&gp)
-		if err != nil {
-			fmt.Println("ERROR: ", err)
+			packetBytes, err := protobuf.Encode(&gp)
+			if err != nil {
+				fmt.Println("ERROR: ", err)
+				return
+			}
+			n, err := conn.Write(packetBytes)
+			if err != nil {
+				fmt.Println("ERROR: ", err)
+				fmt.Println("Number of bytes written:", n)
+				return
+			}
+		}
+	} else if gp.Rumor != nil {
+		if len(g.knownAddresses) == 0 {
 			return
 		}
-		n, err := conn.Write(packetBytes)
-		if err != nil {
-			fmt.Println("ERROR: ", err)
-			fmt.Println("Number of bytes written:", n)
-			return
+		var spreaderIndex int = -1
+		for i, addr := range g.knownAddresses {
+			if addr == spreader {
+				spreaderIndex = i
+				break
+			}
 		}
+		if spreaderIndex == -1 {
+			randomaddress := g.knownAddresses[rand.Intn(len(g.knownAddresses))]
+			conn, err := net.Dial("udp", randomaddress)
+			if err != nil {
+				fmt.Println("ERROR:", err)
+				return
+			}
+			defer conn.Close()
+
+			packetBytes, err := protobuf.Encode(&gp)
+			if err != nil {
+				fmt.Println("ERROR: ", err)
+				return
+			}
+			n, err := conn.Write(packetBytes)
+			if err != nil {
+				fmt.Println("ERROR: ", err)
+				fmt.Println("Number of bytes written:", n)
+				return
+			}
+		} else if len(g.knownAddresses) == 1 {
+			return
+		} else {
+			var randomaddress string
+			randomint := rand.Intn(len(g.knownAddresses) - 1)
+			if randomint < spreaderIndex {
+				randomaddress = g.knownAddresses[randomint]
+			} else {
+				randomaddress = g.knownAddresses[randomint+1]
+			}
+			conn, err := net.Dial("udp", randomaddress)
+			if err != nil {
+				fmt.Println("ERROR:", err)
+				return
+			}
+			defer conn.Close()
+
+			packetBytes, err := protobuf.Encode(&gp)
+			if err != nil {
+				fmt.Println("ERROR: ", err)
+				return
+			}
+			n, err := conn.Write(packetBytes)
+			if err != nil {
+				fmt.Println("ERROR: ", err)
+				fmt.Println("Number of bytes written:", n)
+				return
+			}
+		}
+
+	} else {
+		fmt.Println("What kind of message is this, dude? U wot m8")
 	}
+
 }
 
 func main() {
