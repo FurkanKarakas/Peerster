@@ -16,6 +16,7 @@ var (
 	rumorID      map[string]uint32
 	peerNames    map[string]string
 	GossiperAddr *net.UDPAddr
+	c            chan GossipPacket
 )
 
 //Gossiper contains all relevant inputs to the gossiper program.
@@ -61,6 +62,32 @@ type GossipPacket struct {
 	Status *StatusPacket
 }
 
+//addNewAddrAndPrintPeers adds a new address to the known addresses list if it was not previously known.
+func (g *Gossiper) addNewAddrAndPrintPeers(clientAddress string) {
+	newelement := true
+
+	if g.knownAddresses != nil {
+		for _, element := range g.knownAddresses {
+			if element == clientAddress {
+				newelement = false
+				break
+			}
+		}
+	}
+
+	if newelement {
+		if len(g.peers) == 0 {
+			g.peers = clientAddress
+		} else {
+			g.peers = g.peers + "," + clientAddress
+		}
+		g.knownAddresses = append(g.knownAddresses, clientAddress)
+		fmt.Println("PEERS", g.peers)
+	} else {
+		fmt.Println("PEERS", g.peers)
+	}
+}
+
 //listenClient listens to the client in an infinite loop.
 func (g *Gossiper) listenClient() {
 	portNr, err := strconv.Atoi(g.UIPort)
@@ -87,33 +114,29 @@ func (g *Gossiper) listenClient() {
 			panic(err)
 		}
 		buffer = buffer[0:n]
-		var messageType byte = buffer[len(buffer)-1]
-		switch messageType {
-		case 48: //48 corresponds to 0
-			fmt.Println("CLIENT MESSAGE " + string(buffer[0:len(buffer)-1]))
-			fmt.Println("PEERS " + g.peers)
+		fmt.Println("CLIENT MESSAGE", string(buffer))
+		switch g.simple {
+		case true:
 			var simplemessage SimpleMessage = SimpleMessage{
 				OriginalName:  g.name,
 				RelayPeerAddr: g.gossipAddr,
-				Contents:      string(buffer[0 : len(buffer)-1]),
+				Contents:      string(buffer),
 			}
 			var gp = GossipPacket{Simple: &simplemessage}
 			g.sendGossip(gp, g.gossipAddr)
 
-		case 49: //49 corresponds to 1
-			fmt.Println("CLIENT MESSAGE " + string(buffer[0:len(buffer)-1]))
-			fmt.Println("PEERS " + g.peers)
+		case false:
 			rumorID[g.name]++
 			var rumormessage RumorMessage = RumorMessage{
 				Origin: g.name,
 				ID:     rumorID[g.name],
-				Text:   string(buffer[0 : len(buffer)-1]),
+				Text:   string(buffer),
 			}
 			var gp = GossipPacket{Rumor: &rumormessage}
 			g.sendGossip(gp, g.gossipAddr)
 
 		default: //Some extra logic here if necessary
-			println("Sorry, no known meaning of that last character!")
+			println("Sorry, no known meaning of that flag!")
 			return
 		}
 
@@ -125,6 +148,9 @@ func (g *Gossiper) listenPeers() {
 	for {
 		buffer := make([]byte, 4096)
 		n, temp, err := g.gossiperUDPConn.ReadFromUDP(buffer)
+		if n == 0 {
+			continue
+		}
 		clientAddress := temp.String()
 		//println(clientAddress)
 		if err != nil {
@@ -142,28 +168,13 @@ func (g *Gossiper) listenPeers() {
 		if gossippacket.Simple != nil {
 			fmt.Println("SIMPLE MESSAGE origin", gossippacket.Simple.OriginalName,
 				"from", gossippacket.Simple.RelayPeerAddr, "contents", gossippacket.Simple.Contents)
-			newelement := true
-			for _, element := range g.knownAddresses {
-				if element == gossippacket.Simple.RelayPeerAddr {
-					newelement = false
-					break
-				}
-			}
+			g.addNewAddrAndPrintPeers(clientAddress)
 			//Store the original name in a string map
 			peerNames[clientAddress] = gossippacket.Simple.OriginalName
-			gossippacket.Simple.RelayPeerAddr = g.gossipAddr
-			if newelement {
-				if len(g.peers) == 0 {
-					g.peers = clientAddress
-				} else {
-					g.peers = g.peers + "," + clientAddress
-				}
-				g.knownAddresses = append(g.knownAddresses, clientAddress)
-				fmt.Println("PEERS", g.peers)
-			} else {
-				fmt.Println("PEERS", g.peers)
+			if g.simple {
+				gossippacket.Simple.RelayPeerAddr = g.gossipAddr
+				g.sendGossip(gossippacket, clientAddress)
 			}
-			g.sendGossip(gossippacket, clientAddress)
 
 		} else if gossippacket.Rumor != nil {
 			//Store the original name in a string map
@@ -173,44 +184,27 @@ func (g *Gossiper) listenPeers() {
 			fmt.Println("RUMOR origin", gossippacket.Rumor.Origin,
 				"from", clientAddress, "ID", gossippacket.Rumor.ID,
 				"contents", gossippacket.Rumor.Text)
-			newelement := true
 
-			if g.knownAddresses != nil {
-				for _, element := range g.knownAddresses {
-					if element == clientAddress {
-						newelement = false
-						break
+			g.addNewAddrAndPrintPeers(clientAddress)
+
+			if !g.simple {
+				var psSlice []PeerStatus
+				if g.knownAddresses != nil {
+					for _, address := range g.knownAddresses {
+						if peerNames[address] != "" {
+							psSlice = append(psSlice, PeerStatus{
+								Identifier: peerNames[address],
+								NextID:     rumorID[peerNames[address]] + 1,
+							})
+						}
 					}
 				}
+				sp := StatusPacket{Want: psSlice}
+				gp := GossipPacket{Status: &sp}
+				g.sendGossip(gp, clientAddress)
 			}
 
-			if newelement {
-				if len(g.peers) == 0 {
-					g.peers = clientAddress
-				} else {
-					g.peers = g.peers + "," + clientAddress
-				}
-				g.knownAddresses = append(g.knownAddresses, clientAddress)
-				fmt.Println("PEERS", g.peers)
-			} else {
-				fmt.Println("PEERS", g.peers)
-			}
-			var psSlice []PeerStatus
-			if g.knownAddresses != nil {
-				for _, address := range g.knownAddresses {
-					if peerNames[address] != "" {
-						psSlice = append(psSlice, PeerStatus{
-							Identifier: peerNames[address],
-							NextID:     rumorID[peerNames[address]],
-						})
-					}
-				}
-			}
-			sp := StatusPacket{Want: psSlice}
-			gp := GossipPacket{Status: &sp}
-			g.sendGossip(gp, clientAddress)
-
-		} else if gossippacket.Status != nil {
+		} else if gossippacket.Status != nil { //Need to implement status packet logic.
 			fmt.Print("STATUS from ", clientAddress)
 			for _, element := range gossippacket.Status.Want {
 				fmt.Print(" peer ", element.Identifier, " nextID ", element.NextID)
@@ -262,7 +256,32 @@ func (g *Gossiper) sendGossip(gp GossipPacket, spreader string) {
 		if len(g.knownAddresses) == 0 {
 			return
 		}
-		var spreaderIndex int = -1
+		randomaddress := g.knownAddresses[rand.Intn(len(g.knownAddresses))]
+		//Prepare the destination address
+		tempDestAddr := strings.Split(randomaddress, ":")
+		i, err := strconv.Atoi(tempDestAddr[1])
+		if err != nil {
+			fmt.Println("ERROR:", err)
+			panic(err)
+		}
+		tempDestIPAddr := net.UDPAddr{
+			IP:   net.ParseIP(tempDestAddr[0]),
+			Port: i,
+		}
+		fmt.Println("MONGERING with", randomaddress)
+
+		packetBytes, err := protobuf.Encode(&gp)
+		if err != nil {
+			fmt.Println("ERROR: ", err)
+			panic(err)
+		}
+		n, err := g.gossiperUDPConn.WriteToUDP(packetBytes, &tempDestIPAddr)
+		if err != nil {
+			fmt.Println("ERROR: ", err)
+			fmt.Println("Number of bytes written:", n)
+			panic(err)
+		}
+		/*var spreaderIndex int = -1
 		for i, addr := range g.knownAddresses {
 			if addr == spreader {
 				spreaderIndex = i
@@ -331,7 +350,7 @@ func (g *Gossiper) sendGossip(gp GossipPacket, spreader string) {
 				panic(err)
 			}
 
-		}
+		}*/
 
 	} else if gp.Status != nil {
 		//Prepare the destination address
@@ -394,11 +413,12 @@ func main() {
 		g.knownAddresses = nil
 	}
 	//Open the UDP socket
-	g.gossiperUDPConn, err = net.ListenUDP("udp", GossiperAddr)
+	g.gossiperUDPConn, err = net.ListenUDP("udp4", GossiperAddr)
 	if err != nil {
 		fmt.Println("ERROR:", err)
 		panic(err)
 	}
+	defer g.gossiperUDPConn.Close()
 
 	go g.listenClient()
 	go g.listenPeers()
